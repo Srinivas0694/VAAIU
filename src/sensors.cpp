@@ -96,62 +96,136 @@ void sensors_read(
   float temp_voc = 0, temp_nox = 0;
   uint16_t temp_co2 = 0;
 
-  sen5x.readMeasuredValues(temp_pm1, temp_pm25, temp_pm4, temp_pm10, h_sen5, t_sen5, temp_voc, temp_nox);
-  if (temp_pm1 == 0 && temp_pm25 == 0 && temp_pm4 == 0 && temp_pm10 == 0) {
-    Serial.println("⚠️  sen5x returned zeros, retrying...");
-    delay(200);
-    sen5x.readMeasuredValues(temp_pm1, temp_pm25, temp_pm4, temp_pm10, h_sen5, t_sen5, temp_voc, temp_nox);
+  bool sen5x_success = false;
+  int sen5x_attempts = 0;
+  const int SEN5X_MAX_ATTEMPTS = 3;
+
+  // SEN5x reading with retry logic
+  while (!sen5x_success && sen5x_attempts < SEN5X_MAX_ATTEMPTS) {
+    sen5x_attempts++;
+    Serial.print("SEN5x read attempt ");
+    Serial.println(sen5x_attempts);
+
+    uint16_t error = sen5x.readMeasuredValues(temp_pm1, temp_pm25, temp_pm4, temp_pm10, h_sen5, t_sen5, temp_voc, temp_nox);
+
+    if (error) {
+      Serial.print("❌ SEN5x I2C error: ");
+      Serial.println(error);
+      delay(500); // Wait before retry
+      continue;
+    }
+
+    // Check for all zeros (sensor not ready)
+    if (temp_pm1 == 0 && temp_pm25 == 0 && temp_pm4 == 0 && temp_pm10 == 0) {
+      Serial.println("⚠️  SEN5x returned zeros, sensor may not be ready");
+      if (sen5x_attempts < SEN5X_MAX_ATTEMPTS) {
+        delay(1000); // Wait longer for sensor to be ready
+        continue;
+      }
+    }
+
+    // Validate readings
+    if (isValidPM(temp_pm1) && isValidPM(temp_pm25) && isValidPM(temp_pm4) && isValidPM(temp_pm10)) {
+      pm1 = temp_pm1;
+      pm25 = temp_pm25;
+      pm4 = temp_pm4;
+      pm10 = temp_pm10;
+      voc = isValidVOC(temp_voc) ? temp_voc : 0;
+      nox = isValidVOC(temp_nox) ? temp_nox : 0;
+      sen5x_success = true;
+      Serial.print("✅ SEN5x PM2.5: ");
+      Serial.println(pm25);
+    } else {
+      Serial.println("❌ SEN5x: invalid sensor values received");
+      delay(500);
+    }
   }
 
-  if (isValidPM(temp_pm1) && isValidPM(temp_pm25) && isValidPM(temp_pm4) && isValidPM(temp_pm10)) {
-    pm1 = temp_pm1;
-    pm25 = temp_pm25;
-    pm4 = temp_pm4;
-    pm10 = temp_pm10;
-    Serial.print("✅ sen5x PM2.5: "); Serial.println(pm25);
-  } else if (temp_pm1 == 0 && temp_pm25 == 0 && temp_pm4 == 0 && temp_pm10 == 0) {
-    Serial.println("⚠️  sen5x: no valid data yet");
-  } else {
-    Serial.println("❌ sen5x: invalid sensor values received");
+  if (!sen5x_success) {
+    Serial.println("❌ SEN5x: failed to get valid readings after all attempts");
+    // Keep previous values or set to 0
+    pm1 = pm25 = pm4 = pm10 = voc = nox = 0;
   }
 
-  if (isValidVOC(temp_voc) && isValidVOC(temp_nox)) {
-    voc = temp_voc;
-    nox = temp_nox;
-  }
+  // SCD4x reading with retry logic
+  bool scd4x_success = false;
+  int scd4x_attempts = 0;
+  const int SCD4X_MAX_ATTEMPTS = 5;
 
-  bool ready = false;
-  scd4x.getDataReadyStatus(ready);
-  int attempts = 0;
-  while (!ready && attempts < 3) {
-    delay(200);
-    scd4x.getDataReadyStatus(ready);
-    attempts++;
-  }
+  while (!scd4x_success && scd4x_attempts < SCD4X_MAX_ATTEMPTS) {
+    scd4x_attempts++;
+    Serial.print("SCD4x read attempt ");
+    Serial.println(scd4x_attempts);
 
-  if (ready) {
+    bool ready = false;
+    uint16_t error = scd4x.getDataReadyStatus(ready);
+
+    if (error) {
+      Serial.print("❌ SCD4x getDataReadyStatus error: ");
+      Serial.println(error);
+      delay(500);
+      continue;
+    }
+
+    if (!ready) {
+      Serial.println("⚠️  SCD4x not ready, waiting...");
+      delay(1000); // SCD4x measurement interval is ~5 seconds
+      continue;
+    }
+
     int rc_scd = scd4x.readMeasurement(temp_co2, t_bme, h_bme);
     if (rc_scd == 0 && isValidCO2(temp_co2)) {
       co2 = temp_co2;
-      Serial.print("✅ scd4x CO2: "); Serial.println(co2);
+      scd4x_success = true;
+      Serial.print("✅ SCD4x CO2: ");
+      Serial.println(co2);
     } else if (rc_scd != 0) {
-      Serial.print("❌ scd4x read error: "); Serial.println(rc_scd);
+      Serial.print("❌ SCD4x read error: ");
+      Serial.println(rc_scd);
+      delay(500);
     } else {
-      Serial.println("❌ scd4x: invalid CO2 value");
+      Serial.println("❌ SCD4x: invalid CO2 value");
+      delay(500);
     }
-  } else {
-    Serial.println("⚠️  scd4x not ready after retries");
   }
 
-  if (bme.performReading()) {
-    if (isValidTemp(bme.temperature) && isValidHum(bme.humidity)) {
-      temp = bme.temperature;
-      hum = bme.humidity;
-      Serial.print("✅ bme680 T:"); Serial.print(temp); Serial.print("°C H:"); Serial.println(hum);
+  if (!scd4x_success) {
+    Serial.println("❌ SCD4x: failed to get valid readings after all attempts");
+    co2 = 0;
+  }
+
+  // BME680 reading with retry logic
+  bool bme_success = false;
+  int bme_attempts = 0;
+  const int BME_MAX_ATTEMPTS = 3;
+
+  while (!bme_success && bme_attempts < BME_MAX_ATTEMPTS) {
+    bme_attempts++;
+    Serial.print("BME680 read attempt ");
+    Serial.println(bme_attempts);
+
+    if (bme.performReading()) {
+      if (isValidTemp(bme.temperature) && isValidHum(bme.humidity)) {
+        temp = bme.temperature;
+        hum = bme.humidity;
+        bme_success = true;
+        Serial.print("✅ BME680 T:");
+        Serial.print(temp);
+        Serial.print("°C H:");
+        Serial.println(hum);
+      } else {
+        Serial.println("❌ BME680: invalid temperature/humidity values");
+        delay(500);
+      }
     } else {
-      Serial.println("❌ bme680: invalid temp/humidity values");
+      Serial.println("❌ BME680: performReading failed");
+      delay(500);
     }
-  } else {
-    Serial.println("⚠️  bme680 read failed");
+  }
+
+  if (!bme_success) {
+    Serial.println("❌ BME680: failed to get valid readings after all attempts");
+    temp = 0;
+    hum = 0;
   }
 }

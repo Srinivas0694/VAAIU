@@ -4,7 +4,7 @@
 // Read battery voltage and convert to percent
 static int read_battery_percent() {
   adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11);
+  adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);
   uint16_t raw = adc1_get_raw(ADC1_CHANNEL_7);
   float vbat = (raw / BATTERY_ADC_MAX) * BATTERY_VREF * BATTERY_VOLTAGE_DIVIDER_RATIO;
   float percent = (vbat - BATTERY_VOLTAGE_MIN) / (BATTERY_VOLTAGE_MAX - BATTERY_VOLTAGE_MIN) * 100.0f;
@@ -14,10 +14,8 @@ static int read_battery_percent() {
 }
 /* main.cpp — reorganized, robust, and production-friendly
  *
- * Uses the BLE provisioning module (ble_wifi_*) that is safe:
- *  - BLE initialized once per boot
- *  - advertising started/stopped instead of init/deinit
- *  - WiFi connect initiated non-blocking when credentials arrive
+ * Uses WiFiManager for WiFi provisioning.
+ * WiFiManager creates an access point for configuration when needed.
  *
  * Assumes other modules exist (sensors, display, mqtt).
  */
@@ -27,7 +25,6 @@ static int read_battery_percent() {
 #include <WiFi.h>
 #include <time.h>
 #include <esp_task_wdt.h>
-#include <esp_sleep.h>
 #include "config.hpp"
 // Ensure firmware version macro is defined for reset event publishing
 #ifndef FIRMWARE_VERSION
@@ -36,7 +33,7 @@ static int read_battery_percent() {
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 
-#include "wifi_ble.hpp"
+#include "wifi_manager.hpp"
 #include "config.hpp"
 #include "sensors.hpp"
 #include "display.hpp"
@@ -46,36 +43,24 @@ static int read_battery_percent() {
 #define WATCHDOG_TIMEOUT_SEC    30
 #define TIME_SYNC_TIMEOUT_MS    15000UL
 
-// Deep sleep cycle: 3 minutes active, 2 minutes asleep (total 5‑minute repeating cycle)
-static const unsigned long ACTIVE_DURATION_MS       = 3UL * 60UL * 1000UL;   // 3 minutes
-static const uint64_t      DEEP_SLEEP_DURATION_US   = 2ULL * 60ULL * 1000000ULL; // 2 minutes
-
-// keep track across deep sleep boots (RTC memory)
-RTC_DATA_ATTR static uint32_t bootCount = 0;
-
 // ------------------------ STATE & TIMERS ------------------------
 // Timing intervals
 static const unsigned long PUBLISH_INTERVAL_MS   = 60000UL; // 1 minute
 static const unsigned long SENSOR_INTERVAL_MS    = 60000UL; // 1 minute
 static const unsigned long TIME_UPDATE_MS        = 5000UL;  // 5 seconds
-static const unsigned long WIFI_RETRY_INTERVAL_MS= 60000UL; // 1 minute
 static const unsigned long SETUP_TOGGLE_COOLDOWN_MS = 3000UL; // 3s cooldown
-static const unsigned long BLE_PROVISION_TIMEOUT_MS = 120000UL; // 2 minutes
 
 // ------------------------ TFT ------------------------
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST); // from config.hpp
 
+// ------------------------ WiFiManager Instance ------------------------
+static WiFiManager_Custom wifiManager;
+
 // ------------------------ STATE & TIMERS ------------------------
 static unsigned long lastPublishTime = 0;
 static unsigned long lastSensorReadTime = 0;
-static unsigned long activeStart = 0;  // timestamp when active cycle began
 static unsigned long lastTimeUpdate = 0;
-static unsigned long lastWiFiRetryTime = 0;
 static unsigned long lastSetupToggleTime = 0;
-static unsigned long bleProvStartTime = 0;
-
-// WiFi stored flag
-static bool hasStoredWiFiCredentials = false;
 
 // Sensor values (persist between reads)
 static float last_pm1 = 0, last_pm25 = 0, last_pm4 = 0, last_pm10 = 0;
@@ -94,11 +79,7 @@ static const unsigned long SETUP_DEBOUNCE_MS = 200UL;
 static bool inSettingsMode = false;
 static bool wifiConnected = false;
 static bool mqttInitialized = false;
-static bool bleAdvertisingActive = false;
 static bool showCpuPage = false;
-
-extern String ssid;
-extern String pass;
 
 // ------------------------ ISRs ------------------------
 void IRAM_ATTR bootISR() {
@@ -114,6 +95,11 @@ static void setupWatchdog();
 static void setupButtons();
 static void updateWiFiConnectedState();
 static void handleButtons();
+static void handleSerialCommands();
+static void test_wifi_disconnect_during_publish();
+static void test_mqtt_disconnect_during_cert();
+static void test_network_timeout();
+static void run_error_handling_tests();
 static void enterSetupMode();
 static void exitSetupMode();
 static void finalizeProvisioning();
@@ -127,15 +113,7 @@ static void safeDelayWithWDT(unsigned long ms);
 void setup() {
   Serial.begin(115200);
   delay(100);
-  bootCount++;
-  esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
   Serial.println("\n=== AQI SYSTEM STARTED ===");
-  Serial.printf("Boot count: %u\n", bootCount);
-  if (wakeReason == ESP_SLEEP_WAKEUP_TIMER) {
-    Serial.println("Woke from deep sleep timer");
-  } else if (wakeReason != ESP_SLEEP_WAKEUP_UNDEFINED) {
-    Serial.printf("Wakeup reason: %d\n", wakeReason);
-  }
 
   setupWatchdog();
   setupButtons();
@@ -144,6 +122,10 @@ void setup() {
   WiFi.onEvent([](WiFiEvent_t event) {
     Serial.printf("[WiFi-event] %d\n", event);
   });
+
+  // Initialize WiFi FIRST - establish connection before other components
+  wifiManager.begin("AQI_Device");
+  Serial.println("WiFi initialization complete");
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.println("I2C initialized");
@@ -155,25 +137,6 @@ void setup() {
   Serial.println("Initializing sensors...");
   sensors_init();
   Serial.println("Sensors initialized");
-
-  // Read initial sensor values once
-  sensors_read(
-    last_pm1, last_pm25, last_pm4, last_pm10,
-    last_voc, last_nox, last_co2,
-    last_temp, last_hum
-  );
-
-  // Load saved WiFi credentials from Preferences (wifi_ble module populates ssid/pass)
-  loadSavedWiFi(); 
-  if (ssid.length() > 0) {
-    Serial.println("Saved WiFi credentials found; attempting connection...");
-    hasStoredWiFiCredentials = true;
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    lastWiFiRetryTime = millis();
-  } else {
-    Serial.println("No WiFi credentials stored - press SETUP button to configure WiFi");
-    hasStoredWiFiCredentials = false;
-  }
 
   // Display initial sensor values and time
   int battery_percent = read_battery_percent();
@@ -187,15 +150,7 @@ void setup() {
 
   Serial.println("✅ System initialized successfully");
 
-  // begin active cycle timer
-  activeStart = millis();
-
-  // Always initialize MQTT after WiFi connects (for non-BLE use)
-  if (WiFi.status() == WL_CONNECTED) {
-    mqtt_init();
-    mqttInitialized = true;
-    Serial.println("✅ MQTT initialized (non-BLE mode)");
-  }
+  // MQTT will be initialized in loop() when WiFi connects
 }
 
 // ------------------------ LOOP ------------------------
@@ -204,12 +159,22 @@ void loop() {
 
   updateWiFiConnectedState();
 
+  // Initialize MQTT when WiFi becomes connected
+  if (wifiConnected && !mqttInitialized) {
+    mqtt_init();
+    mqttInitialized = true;
+    Serial.println("✅ MQTT initialized");
+  }
+
   handleButtons();
 
-  // If in settings mode and BLE module reports connected -> finalize provisioning
-  if (inSettingsMode && ble_wifi_connected() && !wifiConnected) {
+  // If in settings mode and WiFi connected -> finalize provisioning
+  if (inSettingsMode && wifiManager.isConnected() && !wifiConnected) {
     finalizeProvisioning();
   }
+
+  // Check setup button for WiFi configuration portal
+  wifiManager.update(SETUP_BUTTON, WIFI_CONFIG_LED, "AQI_SETUP", "password123");
 
   periodicTasks();
 
@@ -217,32 +182,50 @@ void loop() {
     mqtt_loop();
   }
 
-  // check if active period is over
-
-  if (millis() - activeStart >= ACTIVE_DURATION_MS) {
-    Serial.println("Active period expired, entering deep sleep");
-    // turn off display/backlight
-    display_sleep();
-
-    // Publish reset event with reason 'power_off' before sleeping
-    if (mqttInitialized && wifiConnected) {
-      char isoTime[32];
-      time_t nowTime = time(nullptr);
-      struct tm* tm_info = gmtime(&nowTime);
-      strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", tm_info);
-      mqtt_publish_reset_event("ESP32_01", "reset", "power_off", isoTime, FIRMWARE_VERSION);
-      delay(100); // allow MQTT to send
-    }
-
-    // give serial a moment to flush
-    delay(50);
-
-    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION_US);
-    Serial.printf("Going to deep sleep for %llu seconds\n", DEEP_SLEEP_DURATION_US / 1000000ULL);
-    esp_deep_sleep_start(); // does not return
-  }
+  handleSerialCommands();
 
   delay(1);
+}
+
+// Handle serial commands for testing
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "test wifi") {
+      test_wifi_disconnect_during_publish();
+    } else if (command == "test mqtt") {
+      test_mqtt_disconnect_during_cert();
+    } else if (command == "test timeout") {
+      test_network_timeout();
+    } else if (command == "test all") {
+      run_error_handling_tests();
+    } else if (command == "reset wifi") {
+      Serial.println("Resetting WiFi settings...");
+      wifiManager.reset();
+    } else if (command == "status") {
+      Serial.println("=== SYSTEM STATUS ===");
+      Serial.println(mqtt_get_state_info());
+      Serial.print("WiFi Connected: ");
+      Serial.println(wifiConnected ? "YES" : "NO");
+      if (wifiConnected) {
+        Serial.print("WiFi SSID: ");
+        Serial.println(WiFi.SSID());
+        Serial.print("WiFi IP: ");
+        Serial.println(WiFi.localIP());
+      }
+      Serial.println("=====================");
+    } else if (command.length() > 0) {
+      Serial.println("Available commands:");
+      Serial.println("  test wifi    - Test WiFi disconnect during publish");
+      Serial.println("  test mqtt    - Test MQTT disconnect during cert creation");
+      Serial.println("  test timeout - Test network timeout handling");
+      Serial.println("  test all     - Run all error handling tests");
+      Serial.println("  reset wifi   - Reset WiFiManager settings and restart");
+      Serial.println("  status       - Show current system status");
+    }
+  }
 }
 
 // ------------------------ HELPERS ------------------------
@@ -270,9 +253,8 @@ static void updateWiFiConnectedState() {
       wifiConnected = true;
       Serial.println("✅ WiFi connected");
 
-      // If in provisioning mode, notify BLE and switch to sensor page
+      // If in provisioning mode, switch to sensor page
       if (inSettingsMode) {
-        sendWiFiConnectedToBLE();
         showCpuPage = false;  // Switch to sensor page
         display_reinit_layout();
         display_update(
@@ -363,18 +345,6 @@ static void enterSetupMode() {
     mqtt_publish_reset_event("ESP32_01", "reset", "setup_mode", isoTime, FIRMWARE_VERSION);
     delay(100); // allow MQTT to send
   }
-
-  // reset previous attempts so provisioning starts fresh
-  resetWiFiCredentials();
-  resetWiFiConnectionAttempt();
-
-  // initialize BLE module (safe even if already initialized)
-  ble_wifi_init();
-
-  // start advertising (safe)
-  ble_start_advertising();
-  bleAdvertisingActive = true;
-  bleProvStartTime = millis();
 }
 
 static void exitSetupMode() {
@@ -393,24 +363,13 @@ static void exitSetupMode() {
     last_temp, last_hum
   );
   display_update_time();
-
-  // stop advertising (do not deinit BLE)
-  ble_stop_advertising();
-  bleAdvertisingActive = false;
-  Serial.println("BLE advertising stopped (exitSetupMode)");
 }
 
 static void finalizeProvisioning() {
-  Serial.println("✅ BLE reported WiFi connected — finalizing provisioning");
+  Serial.println("✅ WiFi connected — finalizing provisioning");
 
   wifiConnected = true;
   inSettingsMode = false;
-
-  // stop advertising (safe)
-  if (bleAdvertisingActive) {
-    ble_stop_advertising();
-    bleAdvertisingActive = false;
-  }
 
   // Reset timers to resume operations immediately
   lastSensorReadTime = 0;
@@ -485,27 +444,17 @@ static void periodicTasks() {
     doSensorReadAndDisplay();
   }
 
-  // WIFI retry
-  if (hasStoredWiFiCredentials && !wifiConnected && (now - lastWiFiRetryTime >= WIFI_RETRY_INTERVAL_MS)) {
-    lastWiFiRetryTime = now;
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi retry - attempting reconnect");
-      WiFi.reconnect();
-    }
-  }
-
-  // BLE provisioning timeout
-  if (inSettingsMode && bleAdvertisingActive) {
-    if (now - bleProvStartTime > BLE_PROVISION_TIMEOUT_MS) {
-      Serial.println("BLE provisioning timed out — exiting setup mode");
-      exitSetupMode();
-    }
-  }
-
   // PUBLISH
   if (mqttInitialized && wifiConnected && (now - lastPublishTime >= PUBLISH_INTERVAL_MS)) {
     lastPublishTime = now;
     doPublishIfNeeded();
+    
+    // Debug: Print current states every publish cycle
+    Serial.println("=== SYSTEM STATE ===");
+    Serial.println(mqtt_get_state_info());
+    Serial.print("WiFi Connected: ");
+    Serial.println(wifiConnected ? "YES" : "NO");
+    Serial.println("====================");
   }
 }
 
@@ -564,4 +513,109 @@ static void safeDelayWithWDT(unsigned long ms) {
     delay(10);
     esp_task_wdt_reset();
   }
+}
+
+// ================= TEST CASES FOR ERROR HANDLING =================
+// These functions simulate various failure scenarios for testing
+
+// Test Case 1: Simulate WiFi disconnection during MQTT publishing
+void test_wifi_disconnect_during_publish() {
+  Serial.println("🧪 TEST: Simulating WiFi disconnect during publish");
+  
+  // Force disconnect WiFi
+  WiFi.disconnect();
+  delay(1000);
+  
+  // Try to publish (should fail and retry)
+  if (mqttInitialized) {
+    mqtt_publish_with_retry(
+      last_pm1, last_pm25, last_pm4, last_pm10,
+      last_voc, last_nox, last_co2,
+      last_temp, last_hum, 2
+    );
+  }
+  
+  Serial.println("🧪 TEST: WiFi disconnect test completed");
+}
+
+// Test Case 2: Simulate MQTT connection loss during certificate creation
+void test_mqtt_disconnect_during_cert() {
+  Serial.println("🧪 TEST: Simulating MQTT disconnect during certificate creation");
+  
+  if (!provisioningDone && mqtt_is_connected()) {
+    // Force disconnect MQTT
+    mqtt_force_disconnect();
+    delay(2000);
+    
+    // The mqtt_loop should handle reconnection and retry certificate requests
+    Serial.println("🧪 TEST: MQTT disconnect during cert test - check logs for retry behavior");
+  } else {
+    Serial.println("🧪 TEST: Cannot run test - device already provisioned or MQTT not connected");
+  }
+}
+
+// Test Case 3: Test provisioning rejection handling
+void test_provisioning_rejection() {
+  Serial.println("🧪 TEST: Simulating provisioning rejection (cannot actually simulate AWS response)");
+  Serial.println("🧪 TEST: This would need to be tested with actual AWS IoT configuration issues");
+}
+
+// Test Case 4: Test network timeout scenarios
+void test_network_timeout() {
+  Serial.println("🧪 TEST: Testing network timeout handling");
+  
+  // Disconnect WiFi and try operations
+  WiFi.disconnect();
+  delay(2000);
+  
+  // Try MQTT operations (should fail gracefully)
+  if (mqttInitialized) {
+    mqtt_publish_with_retry(
+      last_pm1, last_pm25, last_pm4, last_pm10,
+      last_voc, last_nox, last_co2,
+      last_temp, last_hum, 1
+    );
+  }
+  
+  Serial.println("🧪 TEST: Network timeout test completed");
+}
+
+// Test Case 5: Test invalid certificate handling
+void test_invalid_certificate() {
+  Serial.println("🧪 TEST: Testing invalid certificate handling");
+  Serial.println("🧪 TEST: This would occur if AWS returns malformed certificates");
+  Serial.println("🧪 TEST: Check MQTT callback logs for certificate validation");
+}
+
+// Test Case 6: Test sensor read failures
+void test_sensor_read_failure() {
+  Serial.println("🧪 TEST: Testing sensor read failure handling");
+  
+  // This would need to be implemented in sensors.cpp
+  // For now, just log that sensors should handle read failures gracefully
+  Serial.println("🧪 TEST: Sensor read failures should be handled in sensors.cpp");
+  Serial.println("🧪 TEST: Check sensor logs for timeout/retry behavior");
+}
+
+// Run all test cases (call this from setup for testing)
+void run_error_handling_tests() {
+  Serial.println("🚀 Running error handling test cases...");
+  
+  delay(5000); // Wait for system to stabilize
+  
+  test_wifi_disconnect_during_publish();
+  delay(10000);
+  
+  test_mqtt_disconnect_during_cert();
+  delay(10000);
+  
+  test_network_timeout();
+  delay(10000);
+  
+  test_invalid_certificate();
+  delay(5000);
+  
+  test_sensor_read_failure();
+  
+  Serial.println("✅ All error handling tests completed");
 }

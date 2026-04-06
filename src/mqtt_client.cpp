@@ -44,6 +44,30 @@ String clientId = "aqi-esp32-";
 bool provisioningDone = false;
 static bool certRequested = false;
 static bool provisionRequested = false;
+
+// ================= ERROR HANDLING & RETRY =================
+#define MQTT_RECONNECT_INTERVAL_BASE 5000
+#define MQTT_MAX_RETRIES 10
+#define CERT_REQUEST_TIMEOUT 30000  // 30 seconds
+#define PROVISION_TIMEOUT 60000     // 60 seconds
+#define PUBLISH_RETRY_MAX 3
+
+static unsigned long lastCertRequestTime = 0;
+static unsigned long lastProvisionRequestTime = 0;
+static int certRequestRetries = 0;
+static int provisionRetries = 0;
+static int publishRetries = 0;
+
+// Connection state tracking
+enum MqttState {
+  MQTT_STATE_DISCONNECTED,
+  MQTT_STATE_CONNECTING,
+  MQTT_STATE_CONNECTED,
+  MQTT_STATE_CERT_REQUESTING,
+  MQTT_STATE_PROVISIONING,
+  MQTT_STATE_READY
+};
+static MqttState currentMqttState = MQTT_STATE_DISCONNECTED;
 // ================= CERTIFICATES =================
 // ✅ Amazon Root CA (KEEP – public, safe)
 static const char AWS_ROOT_CA[] PROGMEM = R"EOF(
@@ -150,16 +174,39 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Certificate created
   if (t == CREATE_CERT_SUB) {
-    ownershipToken = doc["certificateOwnershipToken"].as<String>();
-    certificatePem = doc["certificatePem"].as<String>();
-    privateKey     = doc["privateKey"].as<String>();
-    Serial.println("✅ New certificate and private key received");
+    if (doc.containsKey("certificateOwnershipToken") && 
+        doc.containsKey("certificatePem") && 
+        doc.containsKey("privateKey")) {
+      
+      ownershipToken = doc["certificateOwnershipToken"].as<String>();
+      certificatePem = doc["certificatePem"].as<String>();
+      privateKey = doc["privateKey"].as<String>();
+      
+      // Validate certificate format
+      if (certificatePem.startsWith("-----BEGIN CERTIFICATE-----") && 
+          privateKey.startsWith("-----BEGIN RSA PRIVATE KEY-----")) {
+        Serial.println("✅ Valid certificate and private key received");
+        currentMqttState = MQTT_STATE_CERT_REQUESTING; // Will transition to provisioning
+      } else {
+        Serial.println("❌ Invalid certificate format received");
+        // Reset and retry
+        certRequested = false;
+        certRequestRetries = 0;
+        lastCertRequestTime = 0;
+      }
+    } else {
+      Serial.println("❌ Certificate response missing required fields");
+      certRequested = false;
+      certRequestRetries = 0;
+      lastCertRequestTime = 0;
+    }
   }
 
   // Provision success
   if (t == PROVISION_SUB) {
     provisioningDone = true;
     Serial.println("🎉 Device provisioned successfully. Switching credentials...");
+    currentMqttState = MQTT_STATE_READY;
     mqtt.disconnect(); // Trigger reconnect with new certs
   }
 
@@ -172,9 +219,28 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     
     // Check for common errors
     if (doc.containsKey("errorMessage")) {
+      String errorMsg = doc["errorMessage"].as<String>();
       Serial.print("Message: ");
-      Serial.println(doc["errorMessage"].as<String>());
+      Serial.println(errorMsg);
+      
+      // Handle specific error types
+      if (errorMsg.indexOf("CertificateAlreadyProvisioned") >= 0) {
+        Serial.println("ℹ️  Certificate already provisioned - device may already be registered");
+        provisioningDone = true;
+        currentMqttState = MQTT_STATE_READY;
+        return;
+      } else if (errorMsg.indexOf("ResourceConflict") >= 0) {
+        Serial.println("ℹ️  Resource conflict - device ID may already exist");
+      } else if (errorMsg.indexOf("ValidationException") >= 0) {
+        Serial.println("ℹ️  Validation error - check device parameters");
+      }
     }
+    
+    // Reset provisioning state for retry
+    provisionRequested = false;
+    provisionRetries = 0;
+    lastProvisionRequestTime = 0;
+    currentMqttState = MQTT_STATE_CONNECTED;
   }
 }
 
@@ -191,16 +257,21 @@ void mqtt_init() {
   mqtt.setBufferSize(4096);
 }
 
-#define MQTT_RECONNECT_INTERVAL 5000
-#define MQTT_MAX_RETRIES 5
+#define MQTT_RECONNECT_INTERVAL_BASE 5000
+#define MQTT_MAX_RETRIES 10
 
 void mqtt_loop() {
-  if (!mqtt.connected()) {
-    static unsigned long lastTry = 0;
-    static int retryCount = 0;
+  static unsigned long lastTry = 0;
+  static int retryCount = 0;
+  unsigned long now = millis();
 
-    unsigned long now = millis();
-    if (now - lastTry > MQTT_RECONNECT_INTERVAL) {
+  // Calculate exponential backoff for reconnection
+  unsigned long reconnectInterval = MQTT_RECONNECT_INTERVAL_BASE * (1 << min(retryCount, 4)); // Max 5x multiplier
+
+  if (!mqtt.connected()) {
+    currentMqttState = MQTT_STATE_DISCONNECTED;
+    
+    if (now - lastTry > reconnectInterval) {
       lastTry = now;
 
       if (provisioningDone && !usingProvisionedCerts) {
@@ -210,86 +281,123 @@ void mqtt_loop() {
           net.setPrivateKey(privateKey.c_str());
           usingProvisionedCerts = true;
           retryCount = 0;
+          currentMqttState = MQTT_STATE_CONNECTING;
         } else {
-          Serial.println("❌ No valid provisioned credentials");
+          Serial.println("❌ No valid provisioned credentials available");
           return;
         }
       }
 
       Serial.print("🔗 MQTT reconnect attempt ");
       Serial.print(retryCount + 1);
+      Serial.print("/");
+      Serial.print(MQTT_MAX_RETRIES);
       Serial.println("...");
 
+      currentMqttState = MQTT_STATE_CONNECTING;
       if (mqtt.connect(clientId.c_str())) {
         Serial.println("✅ MQTT connected");
         retryCount = 0;
+        currentMqttState = MQTT_STATE_CONNECTED;
 
         if (!usingProvisionedCerts) {
           mqtt.subscribe(CREATE_CERT_SUB);
           mqtt.subscribe(PROVISION_SUB);
           mqtt.subscribe(PROVISION_REJ);
           Serial.println("📡 Subscribed to provisioning topics");
+          currentMqttState = MQTT_STATE_CERT_REQUESTING;
         } else {
           Serial.println("🚀 Ready for data publishing");
+          currentMqttState = MQTT_STATE_READY;
         }
       } else {
         retryCount++;
+        Serial.print("❌ MQTT connection failed, rc=");
+        Serial.println(mqtt.state());
+        
         if (retryCount >= MQTT_MAX_RETRIES) {
-          Serial.println("⚠️  MQTT max retries reached, will retry again later");
-          retryCount = 0;
+          Serial.println("⚠️  MQTT max retries reached, will retry with exponential backoff");
+          // Don't reset retryCount here, let it continue with backoff
         }
       }
     }
     return;
   }
 
+  // MQTT is connected
   mqtt.loop();
 
-  if (usingProvisionedCerts) return;
+  // Handle provisioning workflow
+  if (usingProvisionedCerts) {
+    currentMqttState = MQTT_STATE_READY;
+    return;
+  }
 
-  if (!certRequested) {
-    if (mqtt.publish(CREATE_CERT_PUB, "{}")) {
-      certRequested = true;
-      Serial.println("📨 Certificate request sent");
+  // Certificate request with timeout and retry
+  if (!certRequested || (certRequested && now - lastCertRequestTime > CERT_REQUEST_TIMEOUT)) {
+    if (certRequestRetries < 3) { // Max 3 certificate requests
+      if (mqtt.publish(CREATE_CERT_PUB, "{}")) {
+        certRequested = true;
+        lastCertRequestTime = now;
+        certRequestRetries++;
+        Serial.print("📨 Certificate request sent (attempt ");
+        Serial.print(certRequestRetries);
+        Serial.println("/3)");
+      } else {
+        Serial.println("❌ Failed to send certificate request");
+      }
     } else {
-      Serial.println("❌ Failed to send certificate request");
+      Serial.println("❌ Certificate request failed after 3 attempts");
+      // Could implement fallback or alert here
     }
     return;
   }
 
-  if (ownershipToken.length() > 0 && !provisionRequested) {
-    DynamicJsonDocument doc(2048);
-    doc["certificateOwnershipToken"] = ownershipToken;
-    
-    JsonObject params = doc.createNestedObject("parameters");
-    params["SerialNumber"] = clientId;
+  // Provisioning request with timeout and retry
+  if (ownershipToken.length() > 0 && (!provisionRequested || (provisionRequested && now - lastProvisionRequestTime > PROVISION_TIMEOUT))) {
+    if (provisionRetries < 3) { // Max 3 provisioning attempts
+      DynamicJsonDocument doc(2048);
+      doc["certificateOwnershipToken"] = ownershipToken;
+      
+      JsonObject params = doc.createNestedObject("parameters");
+      params["SerialNumber"] = clientId;
 
-    char payload[512];
-    serializeJson(doc, payload);
+      char payload[512];
+      serializeJson(doc, payload);
 
-    if (mqtt.publish(PROVISION_PUB, payload)) {
-      provisionRequested = true;
-      Serial.println("📦 Provisioning request sent");
+      if (mqtt.publish(PROVISION_PUB, payload)) {
+        provisionRequested = true;
+        lastProvisionRequestTime = now;
+        provisionRetries++;
+        Serial.print("📦 Provisioning request sent (attempt ");
+        Serial.print(provisionRetries);
+        Serial.println("/3)");
+        currentMqttState = MQTT_STATE_PROVISIONING;
+      } else {
+        Serial.println("❌ Failed to send provisioning request");
+      }
     } else {
-      Serial.println("❌ Failed to send provisioning request");
+      Serial.println("❌ Provisioning failed after 3 attempts");
+      // Reset certificate state to try again
+      certRequested = false;
+      certRequestRetries = 0;
+      ownershipToken = "";
+      currentMqttState = MQTT_STATE_CONNECTED;
     }
   }
 }
 
 // ================= DATA PUBLISH =================
-void mqtt_publish(
+bool mqtt_publish_with_retry(
   float pm1, float pm25, float pm4, float pm10,
   float voc, float nox,
   uint16_t co2,
-  float temp, float hum
+  float temp, float hum,
+  int maxRetries = PUBLISH_RETRY_MAX
 ) {
-  Serial.print("[MQTT_PUB] mqtt.connected(): ");
-  Serial.print(mqtt.connected());
-  Serial.print(", provisioningDone: ");
-  Serial.println(provisioningDone);
   if (!mqtt.connected() || !provisioningDone) {
     Serial.println("[MQTT_PUB] Not publishing: MQTT not connected or provisioning not done.");
-    return;
+    return false;
   }
 
   StaticJsonDocument<256> doc;
@@ -316,9 +424,40 @@ void mqtt_publish(
 
    // 🔥 Dynamic topic based on token
   String topic = "aqi/device/" + msgToken;
-  mqtt.publish(topic.c_str(), payload);
-  
-  Serial.println("📤 MQTT data published");
+
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    if (mqtt.publish(topic.c_str(), payload)) {
+      Serial.print("📤 MQTT data published successfully on attempt ");
+      Serial.println(attempt);
+      return true;
+    } else {
+      Serial.print("❌ MQTT publish failed on attempt ");
+      Serial.print(attempt);
+      Serial.print("/");
+      Serial.println(maxRetries);
+      
+      if (attempt < maxRetries) {
+        // Wait before retry with exponential backoff
+        unsigned long waitTime = 1000 * attempt; // 1s, 2s, 3s...
+        Serial.print("⏳ Waiting ");
+        Serial.print(waitTime);
+        Serial.println("ms before retry...");
+        delay(waitTime);
+      }
+    }
+  }
+
+  Serial.println("❌ MQTT publish failed after all retries");
+  return false;
+}
+
+void mqtt_publish(
+  float pm1, float pm25, float pm4, float pm10,
+  float voc, float nox,
+  uint16_t co2,
+  float temp, float hum
+) {
+  mqtt_publish_with_retry(pm1, pm25, pm4, pm10, voc, nox, co2, temp, hum);
 }
 
 // Publishes a reset event with metadata
@@ -335,4 +474,37 @@ void mqtt_publish_reset_event(const char* device_id, const char* event, const ch
   String topic = String("aqi/device/") + device_id + "/event";
   mqtt.publish(topic.c_str(), payload);
   Serial.println("📤 MQTT reset event published");
+}
+
+// Get current MQTT connection state for debugging
+String mqtt_get_state_info() {
+  String info = "MQTT State: ";
+  
+  switch (currentMqttState) {
+    case MQTT_STATE_DISCONNECTED: info += "DISCONNECTED"; break;
+    case MQTT_STATE_CONNECTING: info += "CONNECTING"; break;
+    case MQTT_STATE_CONNECTED: info += "CONNECTED"; break;
+    case MQTT_STATE_CERT_REQUESTING: info += "CERT_REQUESTING"; break;
+    case MQTT_STATE_PROVISIONING: info += "PROVISIONING"; break;
+    case MQTT_STATE_READY: info += "READY"; break;
+  }
+  
+  info += " | Connected: " + String(mqtt.connected() ? "YES" : "NO");
+  info += " | Provisioned: " + String(provisioningDone ? "YES" : "NO");
+  info += " | Using Certs: " + String(usingProvisionedCerts ? "YES" : "NO");
+  info += " | Cert Requested: " + String(certRequested ? "YES" : "NO");
+  info += " | Provision Requested: " + String(provisionRequested ? "YES" : "NO");
+  
+  return info;
+}
+
+bool mqtt_is_connected() {
+  return mqtt.connected();
+}
+
+void mqtt_force_disconnect() {
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+    currentMqttState = MQTT_STATE_DISCONNECTED;
+  }
 }

@@ -20,5 +20,4 @@ void display_reinit_layout();
 void display_clear_all();
 
 // power management
-void display_sleep();      // turn off backlight and clear screen prior to deep sleep
 void display_wake();       // re-enable backlight and redraw layout
