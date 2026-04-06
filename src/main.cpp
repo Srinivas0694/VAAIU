@@ -174,9 +174,22 @@ void loop() {
   }
 
   // Check setup button for WiFi configuration portal
+  static bool lastSetupButtonState = HIGH;
+  bool currentSetupButtonState = digitalRead(SETUP_BUTTON);
+  if (lastSetupButtonState == HIGH && currentSetupButtonState == LOW) {
+    Serial.println("Setup button pressed - starting WiFi portal");
+    wifiManager.startPortal("AQI_SETUP", "password123");
+    digitalWrite(WIFI_CONFIG_LED, HIGH); // Turn on LED when portal starts
+  }
+  lastSetupButtonState = currentSetupButtonState;
+
+  // Update WiFiManager (handles portal processing)
   wifiManager.update(SETUP_BUTTON, WIFI_CONFIG_LED, "AQI_SETUP", "password123");
 
-  periodicTasks();
+  // Small delay to allow other tasks to run
+  safeDelayWithWDT(10);
+
+    periodicTasks();
 
   if (mqttInitialized) {
     mqtt_loop();
@@ -184,7 +197,8 @@ void loop() {
 
   handleSerialCommands();
 
-  delay(1);
+  // Reduced delay since WiFiManager processing is now optimized
+  delay(20);
 }
 
 // Handle serial commands for testing

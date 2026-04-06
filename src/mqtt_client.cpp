@@ -216,13 +216,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Error Detail: ");
     serializeJson(doc, Serial);
     Serial.println();
-    
+
     // Check for common errors
     if (doc.containsKey("errorMessage")) {
       String errorMsg = doc["errorMessage"].as<String>();
       Serial.print("Message: ");
       Serial.println(errorMsg);
-      
+
       // Handle specific error types
       if (errorMsg.indexOf("CertificateAlreadyProvisioned") >= 0) {
         Serial.println("ℹ️  Certificate already provisioned - device may already be registered");
@@ -233,9 +233,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         Serial.println("ℹ️  Resource conflict - device ID may already exist");
       } else if (errorMsg.indexOf("ValidationException") >= 0) {
         Serial.println("ℹ️  Validation error - check device parameters");
+      } else if (errorMsg.indexOf("InvalidPayload") >= 0 || errorMsg.indexOf("cannot be parsed") >= 0) {
+        Serial.println("ℹ️  JSON payload error - check provisioning template parameters");
+        Serial.println("   Template may expect different parameter names or structure");
+      } else if (errorMsg.indexOf("ResourceNotFound") >= 0) {
+        Serial.println("ℹ️  Template not found - check if AQI_Fleet_Template exists in AWS IoT");
       }
     }
-    
+
     // Reset provisioning state for retry
     provisionRequested = false;
     provisionRetries = 0;
@@ -336,7 +341,13 @@ void mqtt_loop() {
   // Certificate request with timeout and retry
   if (!certRequested || (certRequested && now - lastCertRequestTime > CERT_REQUEST_TIMEOUT)) {
     if (certRequestRetries < 3) { // Max 3 certificate requests
-      if (mqtt.publish(CREATE_CERT_PUB, "{}")) {
+      String certPayload = "{}"; // AWS IoT certificate creation requires empty JSON
+
+      Serial.print("🔐 Requesting certificate (attempt ");
+      Serial.print(certRequestRetries + 1);
+      Serial.println("/3)");
+
+      if (mqtt.publish(CREATE_CERT_PUB, certPayload.c_str())) {
         certRequested = true;
         lastCertRequestTime = now;
         certRequestRetries++;
@@ -357,15 +368,27 @@ void mqtt_loop() {
   if (ownershipToken.length() > 0 && (!provisionRequested || (provisionRequested && now - lastProvisionRequestTime > PROVISION_TIMEOUT))) {
     if (provisionRetries < 3) { // Max 3 provisioning attempts
       DynamicJsonDocument doc(2048);
+
+      // Required: certificate ownership token from certificate creation
       doc["certificateOwnershipToken"] = ownershipToken;
-      
+
+      // Parameters object with device-specific information
       JsonObject params = doc.createNestedObject("parameters");
       params["SerialNumber"] = clientId;
+      params["DeviceType"] = "AQI_Sensor";
+      params["FirmwareVersion"] = FIRMWARE_VERSION;
+      params["DeviceLocation"] = "Unknown"; // Could be updated with GPS later
+      params["MACAddress"] = WiFi.macAddress();
+      params["ChipID"] = String(ESP.getEfuseMac(), HEX);
 
-      char payload[512];
+      // Serialize JSON payload
+      String payload;
       serializeJson(doc, payload);
 
-      if (mqtt.publish(PROVISION_PUB, payload)) {
+      Serial.print("📤 Provisioning payload: ");
+      Serial.println(payload);
+
+      if (mqtt.publish(PROVISION_PUB, payload.c_str())) {
         provisionRequested = true;
         lastProvisionRequestTime = now;
         provisionRetries++;

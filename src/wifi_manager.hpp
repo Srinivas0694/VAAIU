@@ -2,9 +2,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <WebServer.h>
-#include <DNSServer.h>
-#include <Preferences.h>
 
 class WiFiManager_Custom {
 public:
@@ -12,6 +11,7 @@ public:
 
     void begin(const char* hostname);
     void update(uint8_t btnPin, uint8_t ledPin, const char* apName, const char* apPass);
+    void startPortal(const char* apName, const char* apPass); // New method to start portal on demand
 
     bool isConnected();
     String getSSID();
@@ -19,23 +19,14 @@ public:
     void reset();
 
 private:
-    Preferences prefs;
-    WebServer* server;
-    DNSServer* dnsServer;
-    
+    WiFiManager manager;
+    WebServer* staServer;  // Web server for STA mode (remote access)
     bool lastState;
-    unsigned long configPortalStartTime;
-    bool configPortalActive;
-    
-    static WiFiManager_Custom* inst;
+    bool portalActive;
+    unsigned long lastProcessTime;
+    static const unsigned long PROCESS_INTERVAL_MS = 20; // Process every 20ms for better responsiveness
 
     void startConfigPortal(const char* apName, const char* apPass);
-    void stopConfigPortal();
-    void handleRoot();
-    void handleConfigSave();
-    void handleStatus();
-    
-    static void handleRootStatic();
-    static void handleConfigSaveStatic();
-    static void handleStatusStatic();
+    void handlePortalTrigger(); // Handle remote portal trigger requests
+    void startSTAServer(); // Start web server for remote access
 };
