@@ -6,6 +6,7 @@ WiFiManager_Custom::WiFiManager_Custom()
       staServer(nullptr),
       lastState(HIGH),
       portalActive(false),
+      portalNoTimeout(false),
       lastProcessTime(0)
 {
 }
@@ -13,26 +14,28 @@ WiFiManager_Custom::WiFiManager_Custom()
 void WiFiManager_Custom::begin(const char* hostname) {
     Serial.println("[WiFiManager] Initializing...");
 
-    // Configure WiFiManager for responsive captive portal
+    // Configure WiFiManager for on-demand captive portal only
     manager.setHostname(hostname);
     manager.setConfigPortalBlocking(false);  // Non-blocking mode
-    manager.setConfigPortalTimeout(300);     // 5 minute timeout instead of infinite
-    manager.setTimeout(30);                  // 30 second connection timeout
-    manager.setSaveConnect(true);            // Save WiFi on connect
-    manager.setEnableConfigPortal(true);     // Enable portal
-    manager.setBreakAfterConfig(false);      // Don't exit after config
-    manager.setAPClientCheck(false);         // Don't require AP client to keep portal open
-    manager.setWebPortalClientCheck(true);   // Keep portal open when web clients are connected
-    manager.setCaptivePortalEnable(true);    // Enable captive portal
+    manager.setConfigPortalTimeout(0);       // no timeout while giving credentials
+    manager.setTimeout(0);                  // no connection timeout while in portal
+    manager.setSaveConnect(true);           // Save WiFi on connect
+    manager.setEnableConfigPortal(true);    // Enable portal
+    manager.setBreakAfterConfig(false);     // Don't exit after config
+    manager.setAPClientCheck(false);        // Don't require AP client to keep portal open
+    manager.setWebPortalClientCheck(true);  // Keep portal open when web clients are connected
+    manager.setCaptivePortalEnable(true);   // Enable captive portal
 
-    // Try to auto-connect first, fallback to portal if needed
-    if (!manager.autoConnect("AQI_SETUP", "password123")) {
-        Serial.println("[WiFiManager] Auto-connect failed, starting config portal");
-        manager.startConfigPortal("AQI_SETUP", "password123");
-    } else {
-        Serial.println("[WiFiManager] Auto-connected successfully");
-        // Start STA web server for remote portal access
+    // Try to connect to any saved WiFi credentials, but do not open portal automatically.
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    Serial.println("[WiFiManager] Attempting saved WiFi connection");
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[WiFiManager] Saved WiFi connected successfully");
         startSTAServer();
+    } else {
+        Serial.println("[WiFiManager] Saved WiFi not connected yet. Waiting for setup button to open portal.");
     }
 
     Serial.println("[WiFiManager] Initialization complete");
@@ -47,7 +50,6 @@ void WiFiManager_Custom::update(uint8_t btnPin, uint8_t ledPin, const char* apNa
         Serial.println("[WiFiManager] Button pressed - starting config portal");
         if (manager.getConfigPortalActive()) {
             manager.stopConfigPortal();
-            delay(200); // Give time to stop
         }
         manager.startConfigPortal(apName, apPass);
     }
@@ -84,6 +86,29 @@ void WiFiManager_Custom::startPortal(const char* apName, const char* apPass) {
         Serial.println("[WiFiManager] Starting config portal on demand");
         manager.startConfigPortal(apName, apPass);
     }
+}
+
+void WiFiManager_Custom::startPortalNoTimeout(const char* apName, const char* apPass) {
+    if (!manager.getConfigPortalActive()) {
+        Serial.println("[WiFiManager] Starting config portal WITHOUT TIMEOUT");
+        portalNoTimeout = true;
+        // Disable all timeouts for this portal session
+        manager.setConfigPortalTimeout(0);     // 0 = no timeout
+        manager.setTimeout(0);                 // 0 = no timeout
+        manager.startConfigPortal(apName, apPass);
+    }
+}
+
+void WiFiManager_Custom::stopPortal() {
+    if (manager.getConfigPortalActive()) {
+        Serial.println("[WiFiManager] Stopping config portal");
+        manager.stopConfigPortal();
+        portalNoTimeout = false;
+    }
+}
+
+bool WiFiManager_Custom::isPortalActive() {
+    return manager.getConfigPortalActive() || manager.getWebPortalActive();
 }
 
 bool WiFiManager_Custom::isConnected() {
