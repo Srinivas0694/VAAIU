@@ -1,4 +1,3 @@
-
 #pragma once
 
 // ================= BATTERY =================
@@ -14,7 +13,7 @@
 #define I2C_SCL 22
 
 // ================= GPIO =================
-#define BOOT_BUTTON 0  // ESP32 Boot button GPIO for toggling pages
+#define BOOT_BUTTON 0  // ESP32 Boot button GPIO for toggling pges
 #define SETUP_BUTTON 32  // Exit button GPIO
 #define WIFI_CONFIG_LED 25  // LED for WiFi configuration mode
 
