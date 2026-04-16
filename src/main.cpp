@@ -22,7 +22,7 @@ static int read_battery_percent() {
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <WiFi.h>
+#include <WiFi.h> 
 #include <time.h>
 #include <esp_task_wdt.h>
 #include "config.hpp"
@@ -54,7 +54,7 @@ static const unsigned long SETUP_TOGGLE_COOLDOWN_MS = 3000UL; // 3s cooldown
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST); // from config.hpp
 
 // ------------------------ WiFiManager Instance ------------------------
-static WiFiManager_Custom wifiManager;
+WiFiManager_Custom wifiManager;
 
 // ------------------------ STATE & TIMERS ------------------------
 static unsigned long lastPublishTime = 0;
@@ -173,32 +173,19 @@ void loop() {
     finalizeProvisioning();
   }
 
-  // Check setup button for WiFi configuration portal
-  static bool lastSetupButtonState = HIGH;
-  bool currentSetupButtonState = digitalRead(SETUP_BUTTON);
-  if (lastSetupButtonState == HIGH && currentSetupButtonState == LOW) {
-    Serial.println("Setup button pressed - starting WiFi portal");
-    wifiManager.startPortal("AQI_SETUP", "password123");
-    digitalWrite(WIFI_CONFIG_LED, HIGH); // Turn on LED when portal starts
-  }
-  lastSetupButtonState = currentSetupButtonState;
-
   // Update WiFiManager (handles portal processing)
   wifiManager.update(SETUP_BUTTON, WIFI_CONFIG_LED, "AQI_SETUP", "password123");
 
   // Small delay to allow other tasks to run
   safeDelayWithWDT(10);
 
-    periodicTasks();
+  periodicTasks();
 
   if (mqttInitialized) {
     mqtt_loop();
   }
 
   handleSerialCommands();
-
-  // Reduced delay since WiFiManager processing is now optimized
-  delay(20);
 }
 
 // Handle serial commands for testing
@@ -266,6 +253,7 @@ static void updateWiFiConnectedState() {
     if (!wifiConnected) {
       wifiConnected = true;
       Serial.println("✅ WiFi connected");
+      wifiManager.startSTAServer();
 
       // If in provisioning mode, switch to sensor page
       if (inSettingsMode) {
@@ -347,8 +335,12 @@ static void handleButtons() {
 
 static void enterSetupMode() {
   inSettingsMode = true;
-  Serial.println("⏹️  Stopping all sensor and MQTT processes");
+  Serial.println("⏹️  Entering WiFi Setup Mode - STOPPING all sensor and MQTT processes");
   display_wifi_setup_screen();
+
+  // Start WiFi portal with NO TIMEOUT for unrushed credential entry
+  digitalWrite(WIFI_CONFIG_LED, HIGH);
+  wifiManager.startPortalNoTimeout("AQI_SETUP", "password123");
 
   // Publish reset event with reason 'setup_mode'
   if (mqttInitialized && wifiConnected) {
@@ -363,12 +355,31 @@ static void enterSetupMode() {
 
 static void exitSetupMode() {
   inSettingsMode = false;
-  Serial.println("✅ Resuming sensor and MQTT processes");
+  Serial.println("✅ Exiting WiFi Setup Mode - Resuming sensor and MQTT processes");
+
+  // Stop WiFi portal
+  wifiManager.stopPortal();
+  digitalWrite(WIFI_CONFIG_LED, LOW);
 
   // Reset timers to resume operations immediately
   lastSensorReadTime = 0;
   lastPublishTime = 0;
   lastTimeUpdate = 0;
+
+  // If WiFi is connected after setup, publish data immediately
+  if (wifiConnected && mqttInitialized) {
+    Serial.println("📡 WiFi connected - Publishing data to AWS...");
+    
+    // Read latest sensor data
+    sensors_read(
+      last_pm1, last_pm25, last_pm4, last_pm10,
+      last_voc, last_nox, last_co2,
+      last_temp, last_hum
+    );
+    
+    // Publish immediately
+    doPublishIfNeeded();
+  }
 
   display_reinit_layout();
   display_update(
