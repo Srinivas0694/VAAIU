@@ -1,18 +1,14 @@
 #include "display.hpp"
 #include "config.hpp"
-#include "logo.hpp"
 
-#include <WiFi.h>
 #include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 
-// --- Fonts ---
-// Make sure these are installed in your library
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
-
+ 
 extern Adafruit_ST7789 tft;
 
 /* --- Modern Color Palette (Dark Theme) --- */
@@ -30,26 +26,14 @@ extern Adafruit_ST7789 tft;
 #define SCREEN_W      320
 #define SCREEN_H      240
 
-// Main Cards
-#define CARD_Y        45
-#define CARD_H        85
-#define CARD_W        152 // (320 - 16 padding) / 2
-
-// Grid
-#define GRID_Y        145
-#define GRID_H        90
-#define GRID_ROW_H    40
-
 DisplayMode currentDisplayMode = DISPLAY_MAIN;
 
 /* ================= HELPERS ================= */
 
-// Draw a smooth rounded panel
 void drawPanel(int x, int y, int w, int h, uint16_t color) {
   tft.fillRoundRect(x, y, w, h, 8, color);
 }
 
-// Draw text centered in a specific box
 void drawCentered(const char* txt, int x, int y, int w, int h, const GFXfont* font, uint16_t color, bool centerY = true) {
   tft.setFont(font);
   tft.setTextColor(color);
@@ -57,78 +41,127 @@ void drawCentered(const char* txt, int x, int y, int w, int h, const GFXfont* fo
   int16_t x1, y1;
   uint16_t wt, ht;
   tft.getTextBounds(txt, 0, 0, &x1, &y1, &wt, &ht);
-
   int xPos = x + (w - wt) / 2;
-
-  // Vertical centering logic for FreeFonts (which draw from baseline)
-  int yPos = y + h - 6; // Default baseline offset
-  if(centerY) {
-    yPos = y + (h/2) + (ht/2) - 2;
+  int yPos = y + h - 6;
+  if (centerY) {
+    yPos = y + (h / 2) + (ht / 2) - 2;
   }
 
   tft.setCursor(xPos, yPos);
   tft.print(txt);
 }
 
-// Right aligned text helper
-void drawRightAligned(String txt, int x, int y, int w, const GFXfont* font, uint16_t color) {
-  tft.setFont(font);
-  tft.setTextColor(color);
-  int16_t x1_tb, y1_tb;
-  uint16_t wt, ht;
-  tft.getTextBounds(txt, 0, 0, &x1_tb, &y1_tb, &wt, &ht);
-  tft.setCursor(x + w - wt - 4, y + ht - 6);
-  tft.print(txt);
+static void draw_battery_percent(int percent) {
+  int x = SCREEN_W - 65;
+  int y = 8;
+  int w = 55;
+  int h = 24;
+  tft.fillRect(x, y, w, h, C_HEADER);
+  tft.setFont(&FreeSansBold9pt7b);
+  tft.setTextColor(C_ACCENT);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", percent);
+  int16_t x1, y1;
+  uint16_t tw, th;
+  tft.getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
+  tft.setCursor(x + w - tw - 4, y + h - 8);
+  tft.print(buf);
 }
 
-// Draw battery percentage indicator
-static void draw_battery_percent(int percent) {
-  if (percent < 0) return; // Skip if no battery data
+static void drawValueCell(int col, int row, const String& label, const String& value, uint16_t valueColor = C_TEXT_MAIN) {
+  int gridCols = 2;
+  int gridRows = 5;
+  int gridW = SCREEN_W - 20;
+  int gridH = SCREEN_H - 50;
+  int cellW = gridW / gridCols;
+  int cellH = gridH / gridRows;
+  int startX = 10;
+  int startY = 40;
+  int x = startX + col * cellW;
+  int y = startY + row * cellH;
 
-  int x = 280, y = 10, w = 30, h = 15;
-  tft.drawRoundRect(x, y, w, h, 2, C_TEXT_MUTED);
-
-  // Battery level
-  int fillW = (percent * (w - 4)) / 100;
-  uint16_t color = (percent > 20) ? C_GOOD : (percent > 10) ? C_WARN : C_ALERT;
-  tft.fillRect(x + 2, y + 2, fillW, h - 4, color);
-
-  // Text
-  char buf[5];
-  sprintf(buf, "%d%%", percent);
+  tft.fillRect(x + 2, y + 2, cellW - 4, cellH - 4, C_BG);
   tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(C_TEXT_MAIN);
-  tft.setCursor(x - 35, y + h - 2);
-  tft.print(buf);
+  tft.setTextColor(C_TEXT_MUTED);
+  tft.setCursor(x + 8, y + 18);
+  tft.print(label);
+
+  tft.setTextColor(valueColor);
+  int16_t x1, y1;
+  uint16_t wt, ht;
+  tft.getTextBounds(value.c_str(), 0, 0, &x1, &y1, &wt, &ht);
+  tft.setCursor(x + cellW - wt - 8, y + 18);
+  tft.print(value);
+}
+
+static void drawFullWidthCell(const String& label, const String& value, uint16_t valueColor = C_TEXT_MAIN) {
+  int gridW = SCREEN_W - 20;
+  int gridRows = 5;
+  int gridH = SCREEN_H - 50;
+  int cellH = gridH / gridRows;
+  int startX = 10;
+  int startY = 40;
+  int x = startX;
+  int y = startY + 4 * cellH;
+  int w = gridW;
+
+  tft.fillRect(x + 2, y + 2, w - 4, cellH - 4, C_BG);
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(C_TEXT_MUTED);
+  tft.setCursor(x + 8, y + 18);
+  tft.print(label);
+
+  tft.setTextColor(valueColor);
+  int16_t x1, y1;
+  uint16_t wt, ht;
+  tft.getTextBounds(value.c_str(), 0, 0, &x1, &y1, &wt, &ht);
+  tft.setCursor(x + w - wt - 8, y + 18);
+  tft.print(value);
 }
 
 /* ================= INIT ================= */
 
 void display_init() {
-  tft.init(240, 320); // ST7789 320x240 in portrait
-  tft.setRotation(1); // Landscape orientation
-
-  // Backlight control
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+  delay(50);
+  digitalWrite(TFT_RST, HIGH);
+  delay(50);
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH); // Turn on backlight
+  digitalWrite(TFT_BL, HIGH);
 
-  tft.fillScreen(C_BG);
-
-  // Draw logo initially - simple text logo
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(C_ACCENT);
-  tft.setCursor(80, 120);
-  tft.print("AQI MONITOR");
-  tft.setCursor(110, 140);
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(C_TEXT_MUTED);
-  tft.print("v1.0.3");
-  delay(2000);
-
-  currentDisplayMode = DISPLAY_MAIN;
+  tft.init(240, 320);
+  tft.setRotation(1);
+  display_reinit_layout();
 }
 
-/* ================= MAIN DISPLAY ================= */
+/* ================= LAYOUT ================= */
+
+void display_reinit_layout() {
+  currentDisplayMode = DISPLAY_MAIN;
+  tft.fillScreen(C_BG);
+
+  tft.fillRect(0, 0, SCREEN_W, 40, C_HEADER);
+  tft.setFont(&FreeSansBold12pt7b);
+  tft.setTextColor(C_ACCENT);
+  tft.setCursor(10, 28);
+  tft.print("VAAIU MONITOR");
+
+  int gridCols = 2;
+  int gridRows = 5;
+  int gridW = SCREEN_W - 20;
+  int gridH = SCREEN_H - 50;
+  int cellW = gridW / gridCols;
+  int cellH = gridH / gridRows;
+  int startX = 10;
+  int startY = 40;
+
+  tft.drawRect(startX, startY, gridW, gridH, C_PANEL);
+  tft.drawFastVLine(startX + cellW, startY, gridH, C_PANEL);
+  for (int i = 1; i < gridRows; ++i) {
+    tft.drawFastHLine(startX, startY + i * cellH, gridW, C_PANEL);
+  }
+}
 
 void display_update(float pm1, float pm25, float pm4, float pm10, float voc, float nox, uint16_t co2, float temp, float hum) {
   display_update_with_battery(pm1, pm25, pm4, pm10, voc, nox, co2, temp, hum, -1);
@@ -137,65 +170,17 @@ void display_update(float pm1, float pm25, float pm4, float pm10, float voc, flo
 void display_update_with_battery(float pm1, float pm25, float pm4, float pm10, float voc, float nox, uint16_t co2, float temp, float hum, int battery_percent) {
   if (currentDisplayMode != DISPLAY_MAIN) return;
 
-  tft.fillScreen(C_BG);
-
-  // Header
-  drawPanel(0, 0, SCREEN_W, 40, C_HEADER);
-  drawCentered("AQI MONITOR", 0, 0, SCREEN_W, 40, &FreeSansBold12pt7b, C_TEXT_MAIN);
-
-  // Battery indicator
   draw_battery_percent(battery_percent);
 
-  // Main cards
-  int gap = 8;
-  int card1_x = gap;
-  int card2_x = gap + CARD_W + gap;
-
-  // PM2.5 Card
-  drawPanel(card1_x, CARD_Y, CARD_W, CARD_H, C_PANEL);
-  drawCentered("PM2.5", card1_x, CARD_Y, CARD_W, 25, &FreeSansBold9pt7b, C_TEXT_MAIN, false);
-  char pm25_str[16];
-  sprintf(pm25_str, "%.1f", pm25);
-  drawCentered(pm25_str, card1_x, CARD_Y + 25, CARD_W, 35, &FreeSansBold12pt7b, C_ACCENT);
-  drawCentered("μg/m³", card1_x, CARD_Y + 60, CARD_W, 20, &FreeSans9pt7b, C_TEXT_MUTED, false);
-
-  // CO2 Card
-  drawPanel(card2_x, CARD_Y, CARD_W, CARD_H, C_PANEL);
-  drawCentered("CO2", card2_x, CARD_Y, CARD_W, 25, &FreeSansBold9pt7b, C_TEXT_MAIN, false);
-  char co2_str[16];
-  sprintf(co2_str, "%u", co2);
-  drawCentered(co2_str, card2_x, CARD_Y + 25, CARD_W, 35, &FreeSansBold12pt7b, C_ACCENT);
-  drawCentered("ppm", card2_x, CARD_Y + 60, CARD_W, 20, &FreeSans9pt7b, C_TEXT_MUTED, false);
-
-  // Data grid
-  int grid_x = gap;
-  int grid_w = SCREEN_W - 2 * gap;
-
-  // Temperature
-  tft.fillRect(grid_x, GRID_Y, grid_w, GRID_ROW_H, C_PANEL);
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(C_TEXT_MAIN);
-  tft.setCursor(grid_x + 8, GRID_Y + 28);
-  tft.print("Temperature");
-  char temp_str[16];
-  sprintf(temp_str, "%.1f°C", temp);
-  drawRightAligned(temp_str, grid_x, GRID_Y, grid_w, &FreeSans9pt7b, C_ACCENT);
-
-  // Humidity
-  tft.fillRect(grid_x, GRID_Y + GRID_ROW_H, grid_w, GRID_ROW_H, C_PANEL);
-  tft.setCursor(grid_x + 8, GRID_Y + GRID_ROW_H + 28);
-  tft.print("Humidity");
-  char hum_str[16];
-  sprintf(hum_str, "%.1f%%", hum);
-  drawRightAligned(hum_str, grid_x, GRID_Y + GRID_ROW_H, grid_w, &FreeSans9pt7b, C_ACCENT);
-
-  // VOC
-  tft.fillRect(grid_x, GRID_Y + 2 * GRID_ROW_H, grid_w, GRID_ROW_H, C_PANEL);
-  tft.setCursor(grid_x + 8, GRID_Y + 2 * GRID_ROW_H + 28);
-  tft.print("VOC Index");
-  char voc_str[16];
-  sprintf(voc_str, "%.1f", voc);
-  drawRightAligned(voc_str, grid_x, GRID_Y + 2 * GRID_ROW_H, grid_w, &FreeSans9pt7b, C_ACCENT);
+  drawValueCell(0, 0, "PM1.0", String(pm1, 0));
+  drawValueCell(1, 0, "NOX", String(nox, 0));
+  drawValueCell(0, 1, "PM2.5", String(pm25, 1), (pm25 > 150) ? C_ALERT : (pm25 > 35 ? C_WARN : C_GOOD));
+  drawValueCell(1, 1, "CO2", String(co2) + " ppm", (co2 > 1000) ? C_WARN : C_GOOD);
+  drawValueCell(0, 2, "PM4", String(pm4, 0));
+  drawValueCell(1, 2, "Temp", String(temp, 1) + "C");
+  drawValueCell(0, 3, "PM10", String(pm10, 0));
+  drawValueCell(1, 3, "Hum", String(hum, 0) + "%");
+  drawFullWidthCell("VOC", String(voc, 0) + " ppm");
 }
 
 void display_update_time() {
@@ -204,59 +189,58 @@ void display_update_time() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
 
-  char timeStr[9];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+  char timeStr[6];
+  strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
 
-  // Draw time in header
-  tft.fillRect(200, 5, 70, 30, C_HEADER);
+  tft.fillRect(200, 0, 120, 40, C_HEADER);
   tft.setFont(&FreeSans9pt7b);
   tft.setTextColor(C_TEXT_MAIN);
-  tft.setCursor(205, 28);
+  tft.setCursor(208, 26);
   tft.print(timeStr);
 }
-
-/* ================= OTHER MODES ================= */
 
 void display_cpu_status() {
   currentDisplayMode = DISPLAY_CPU_STATUS;
   tft.fillScreen(C_BG);
 
-  drawPanel(20, 20, SCREEN_W - 40, SCREEN_H - 40, C_PANEL);
-  drawCentered("CPU STATUS", 0, 40, SCREEN_W, 40, &FreeSansBold12pt7b, C_TEXT_MAIN);
+  tft.fillRect(0, 0, SCREEN_W, 40, C_HEADER);
+  tft.setFont(&FreeSansBold12pt7b);
+  tft.setTextColor(C_ACCENT);
+  tft.setCursor(10, 28);
+  tft.print("CPU STATUS");
 
   tft.setFont(&FreeSans9pt7b);
   tft.setTextColor(C_TEXT_MUTED);
-  tft.setCursor(40, 100);
-  tft.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-  tft.setCursor(40, 130);
-  tft.printf("CPU Freq: %d MHz\n", ESP.getCpuFreqMHz());
-  tft.setCursor(40, 160);
-  tft.printf("Uptime: %lu seconds\n", millis() / 1000);
+  tft.setCursor(40, 90);
+  tft.printf("Free Heap: %d bytes", ESP.getFreeHeap());
+  tft.setCursor(40, 120);
+  tft.printf("CPU Freq: %d MHz", ESP.getCpuFreqMHz());
+  tft.setCursor(40, 150);
+  tft.printf("Uptime: %lu sec", millis() / 1000);
 }
 
 void display_wifi_setup_screen() {
   currentDisplayMode = DISPLAY_WIFI_SETUP;
   tft.fillScreen(C_BG);
 
-  // Modern Alert Box
-  int bx = 30, by = 40, bw = 260, bh = 160;
-  drawPanel(bx, by, bw, bh, C_PANEL);
+  tft.fillRect(0, 0, SCREEN_W, 40, C_HEADER);
+  tft.setFont(&FreeSansBold12pt7b);
+  tft.setTextColor(C_ACCENT);
+  tft.setCursor(10, 28);
+  tft.print("SETUP MODE");
 
-  // Icon placeholder (Orange square)
+  int bx = 30;
+  int by = 60;
+  int bw = 260;
+  int bh = 140;
+  drawPanel(bx, by, bw, bh, C_PANEL);
   tft.fillRoundRect(bx + 110, by - 20, 40, 40, 8, C_WARN);
   drawCentered("!", bx + 110, by - 20, 40, 40, &FreeSansBold12pt7b, C_BG);
-
-  drawCentered("SETUP MODE", bx, by + 40, bw, 30, &FreeSansBold12pt7b, C_TEXT_MAIN);
-
+  drawCentered("WIFI SETUP", bx, by + 40, bw, 30, &FreeSansBold9pt7b, C_TEXT_MAIN);
   tft.setFont(&FreeSans9pt7b);
   tft.setTextColor(C_TEXT_MUTED);
   drawCentered("Connect to Hotspot:", bx, by + 80, bw, 20, &FreeSans9pt7b, C_TEXT_MUTED);
   drawCentered("AQI_SETUP", bx, by + 110, bw, 30, &FreeSansBold9pt7b, C_ACCENT);
-}
-
-void display_reinit_layout() {
-  currentDisplayMode = DISPLAY_MAIN;
-  tft.fillScreen(C_BG);
 }
 
 void display_clear_all() {
@@ -264,41 +248,6 @@ void display_clear_all() {
 }
 
 void display_wake() {
-  digitalWrite(TFT_BL, HIGH); // Turn on backlight
+  digitalWrite(TFT_BL, HIGH);
   display_reinit_layout();
 }
-
-// Draw a colored dot status indicator
-void drawStatusDot(int x, int y, uint16_t color) {
-  tft.fillCircle(x, y, 4, color);
-}
-
-/* ================= UPDATE ================= */
-
-// Helper to clear and redraw a number without flicker
-void redrawValue(int x, int y, String val, bool isAlert, bool large) {
-  int boxW = large ? 90 : 50;
-  int boxH = large ? 30 : 20;
-  int yOff = large ? -24 : -16;
-  
-  // 1. Clear area (Fill with background color)
-  uint16_t bg = large ? C_PANEL : C_BG; 
-  tft.fillRect(x, y + yOff, boxW, boxH, bg);
-
-  // 2. Setup Font/Color
-  if (large) tft.setFont(&FreeSansBold12pt7b);
-  else tft.setFont(&FreeSansBold9pt7b);
-  
-  tft.setTextColor(isAlert ? C_ALERT : C_TEXT_MAIN);
-
-  // 3. Draw
-  tft.setCursor(x, y);
-  tft.print(val);
-}
-
-
-
-
-
-
-/* ================= SYSTEM SCREENS ================= */
